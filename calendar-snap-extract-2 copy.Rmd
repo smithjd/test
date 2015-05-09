@@ -1,0 +1,295 @@
+---
+title: "Calendar Snapshot Data gathering V 2"
+author: "John D. Smith"
+date: "April 28, 2015"
+output: html_document
+---
+
+Declarations and setup
+
+```{r}
+library(RMySQL)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(reshape2)
+library(xtable)
+
+setwd("~/Documents/Shambhala/PSMC-Comm-IT/statistics/misc-queries")
+
+# con  <- dbConnect(MySQL(), user="Predictor", password= Sys.getenv("SDB_PASSWORD"),
+#                   dbname="SDB_STATISTICS", host="46.252.31.8", port=3308)
+
+my_sdb <- src_mysql(user = "Predictor", password = Sys.getenv("SDB_PASSWORD"),
+                  dbname = "SDB_STATISTICS", host = "46.252.31.8", port = 3308)
+ 
+source("misc-tables.R")
+program_codes_tbl  <- read_tsv("prog_codes_table.tsv")
+program_series_tbl <- read_tsv("program_series_table.csv")
+
+```
+
+pull registrations and calendar data
+
+Need to include ALL registrations and the WHOLE shambhala calendar before zeroing in on ONE Center's members / calendar.
+
+```{r, echo=FALSE}
+
+sdb_registrations <- tbl(my_sdb, "registrations")
+sdb_registrations_internet <- tbl(my_sdb, "registrations_internet")
+sdb_calendar  <- tbl(my_sdb, "calendar")
+
+registrations <- sdb_registrations %>%
+  select(reg_id = id, calendar_id = idcalendar, member_id = idmember, registration_date = date) %>%
+  collect() %>% 
+  mutate(registration_date = sub("0000-00-00 00:00:00", " ", registration_date),  
+         registration_date = ymd_hms(registration_date))
+
+registrations_internet <- sdb_registrations_internet %>%
+  select(reg_id = id, calendar_id = idcalendar, member_id = idmember, registration_date = date) %>%
+  collect() %>% 
+  mutate(registration_date = sub("0000-00-00 00:00:00", " ", registration_date),  
+         registration_date = ymd_hms(registration_date))
+
+registrations <- bind_rows(registrations, registrations_internet) %>% filter(calendar_id != 0)
+
+registration_stats  <- registrations  %>% group_by(calendar_id)  %>% 
+  summarise(first_registrations = min(registration_date, na.rm = T),
+            median_registrations = median(registration_date, na.rm = T),
+            last_registrations = max(registration_date, na.rm = T),  total_registrations_count = n())
+
+calendar <- sdb_calendar  %>%
+  select(calendar_id = id, cal_create_dt = created, date_begin, date_end,  
+         program_code = code, program_price = price,
+         location, program_name = name, local_event, public, max_reg, 
+         teacher1, teacher2, cancelled, visible ) %>% 
+  collect() %>% 
+    # deal with a bunch of date issues, like missing date, calculate length of time, quarter, etc.
+    mutate(
+       date_begin = sub("0000-00-00 00:00:00", " ", date_begin),  date_begin = ymd_hms(date_begin),
+       date_end = sub("0000-00-00 00:00:00", " ", date_end),  date_end = ymd_hms(date_end),
+       cal_create_dt = sub("0000-00-00 00:00:00", " ", cal_create_dt),  cal_create_dt = ymd_hms(cal_create_dt),
+       # the following calc messes up date_end, so leaving NA's 
+       # date_end = ifelse(is.na(date_end) & !is.na(date_begin), date_begin + 86400, date_end), 
+       class_length_days = difftime(date_end, date_begin, units = "days"), 
+       day_begin = weekdays(date_begin, abbreviate = F),
+       create_to_begin_weeks = difftime(date_begin, cal_create_dt, units = "weeks"),
+       quarter_begin = paste( year(date_begin), "-Q", quarter(date_begin), sep = ""),
+       program_price_num = sub(" .+$", "", program_price),  
+       program_price_num = as.numeric(gsub("\\$", "", program_price_num)),
+       weekend_class = ifelse(day_begin %in% c("Friday","Saturday","Sunday") & 
+                            class_length_days < 3, 1, 0)
+         )
+# for historic data, date_end in the calendar table is sometimes missing, 
+#   so it would be nice to set it to something reasonable.  Difficult.
+
+calendar <- left_join(calendar, program_codes_tbl)
+cal_stats <- left_join(calendar, registration_stats)
+
+# str(calendar)
+# str(program_codes_tbl)
+
+```
+Pull membership data 
+```{r, echo=FALSE}
+
+sdb_members <- tbl(my_sdb, "members")
+members  <- sdb_members %>% 
+  select(member_id = id, m_rec_date_changed = changed, member_center = center, membertype, 
+         m_rec_date_create = created, creator, editor, ismale) %>% 
+  collect() %>% mutate(
+        m_rec_date_create = sub("0000-00-00 00:00:00", " ", m_rec_date_create),  
+        m_rec_date_create = ymd_hms(m_rec_date_create),
+        m_rec_date_changed = sub("0000-00-00 00:00:00", " ", m_rec_date_changed),  
+        m_rec_date_changed = ymd_hms(m_rec_date_changed))
+
+# Join them all together in various ways
+
+# gather member/non-member counts for each event / center combination:
+
+lj_mem_reg <- left_join(members,registrations) %>% filter(!is.na(reg_id)) %>%
+  mutate( ismember = ifelse(membertype %in% c("3", "4","5"), "Member", "Non_member") ) %>% 
+  group_by(member_center, ismember, calendar_id) %>% summarise(registrations = n()) %>% 
+  select(calendar_id, member_center, ismember, registrations )
+
+# transpose the dataset...
+lj_mem_reg_wide <- dcast(lj_mem_reg, calendar_id + member_center ~ ismember, 
+                         value.var = "registrations" ) %>% 
+  mutate(Member = ifelse(is.na(Member), 0, Member),
+         Non_member = ifelse(is.na(Non_member), 0, Non_member),
+         total_reg = Member + Non_member)
+
+# gather registration profile for each event.
+
+
+# est_elders_lang_wide <- dcast(est_elders_lang, country_language+membertype ~ e_older, value.var = "count")
+# %>% select(-member_id, -m_rec_date_changed, -m_rec_date_create, -creator, -editor, -reg_id)
+
+dim(lj_mem_reg)
+# lj_reg_cal <- left_join(registrations,calendar)
+# lj_reg_cal_mem <- left_join(lj_reg_cal, members)
+
+# lj_mem_reg <- left_join(members,registrations)
+# lj_mem_reg_cal <- left_join(lj_mem_reg,calendar)
+# save(lj_mem_reg_cal,file="lj_mem_reg_cal.Rdata")
+```
+save dagasets
+```{r}
+save(cal_stats,calendar,center214,members,registrations,registration_stats,
+     file = "all_files.Rdata")
+
+```
+working / testing
+```{r}
+
+# save(calendar,members,registrations, file = "base_calendaring_files.Rdata")
+# save(member_type_tbl,program_codes_tbl,program_series_tbl,type_of_program.tbl,
+     # file = "base_calendaring_tables.Rdata")
+
+series_reg <- registrations %>% filter(calendar_id %in% c(55907, 55905, 55906))
+series_sample <- left_join(series_reg,calendar)
+series_sample %<>% arrange(desc(registration_date)) 
+  
+series_comp <- dcast(series_sample, calendar_id + program_code + reg_id ~ program_name,value.var =  "registration_date")
+
+nam_list[4]  <- "L01"
+nam_list[5]  <- "MEL"
+nam_list[6]  <- "SER"
+names(series_comp)  <- nam_list
+
+series_comp  %<>% mutate(L01 = as.Date.POSIXct(L01, origin = "1970-01-01 00:00:00 GMT"),
+                         MEL = as.Date.POSIXct(MEL, origin = "1970-01-01 00:00:00 GMT"),
+                         SER = as.Date.POSIXct(SER, origin = "1970-01-01 00:00:00 GMT")
+                         )
+series_comp_a <- left_join(series_comp,series_reg) %>% arrange(desc(registration_date))
+
+no_travel_rept_1 <- dcast(no_travel_rept, ever_at_land_center + ever_at_other_center + ever_at_home_center  ~ membertype , value.var = "n_mems")  %>% arrange(desc(ever_at_land_center), desc(ever_at_other_center), desc(ever_at_home_center))
+
+
+```
+
+Look at individual centers
+
+
+```{r}
+
+center_id <- "214" # Portland
+# center_id <- "211" # Seatttle
+# center_id <- "212"  # Austin
+# center_id <- "210"  # Philadelphia
+# center_id <- "236"  # Vancouver
+# center_id <- "196"  # Atlanta
+# center_id <- "237"  # Victoria
+# center_id <- "211"  # Seattle
+# center_id <- "214"  # Portland
+# center_id <- "195"  # Minneapolis
+
+
+# center214 <- lj_reg_cal_mem %>% filter(location == center_id | center == center_id )
+center214 <- cal_stats %>% filter(location == center_id & event_type == "Way of Shambhala" )
+summary(center214)
+
+# check out https://shambhala.name/report_event.php?id=223092 
+
+#   bg_event2 <- lj_reg_cal_mem %>% filter(calendar_id == 202166)
+#   # no location code
+#   bg_cal <- calendar %>% filter(calendar_id == 223092)
+
+library(googlesheets)
+library(httr)
+
+# 2. Register an application at https://cloud.google.com/console#/project
+# Replace key and secret below.
+my_google <- oauth_app("google", key = Sys.getenv("jds_shambhala_id"), secret = Sys.getenv("jds_shambhala_secret" ))
+
+google_token <- oauth2.0_token(oauth_endpoints("google"), my_google,
+scope = "https://www.googleapis.com/auth/userinfo.profile")
+
+write.csv(center214, "center214.csv", row.names = F) # create local copy
+my_ss <- upload_ss("center214.csv") # local copy
+file.remove("center214.csv") # local copy
+
+```
+Calc based on the calendar itself
+
+  * length of classes (end-date minus start-date)
+  * day of week class starts
+  * weeks between event first posted and event start date
+  * classify as weekend / weeknight
+  classify as core curriculum, e.g.,
+    event_type in "Introductory Programs", "Sacred Path", "Way of Shambhala"
+  classify by program category (core, practice, other)
+  *  program price as a number
+
+Depend on member record merge
+  % of registrants who are members
+  % of registrants who are not local (e.g., out-of-towners)
+  weeks between event first posted and first registrant
+  median registrant and event start date
+  % of your students taking classes elsewhere
+
+teacher info
+  % of classes taught by one or more local teachers
+  % of classes taught by one or more out-of-towners
+  % of classes taught by a local and out-of-towner  ??
+
+After Aggregation
+  Average enrollments by program category
+  number of public classes
+  number of classes with pre-requisites
+  % of classes that are not in the core curriculum
+  weekend / weeknight ratio
+
+-------
+% of classes through Shambhala Online (Rockwell) look like an out of town teacher
+
+```{r}
+
+hasteach  <- calendar  %>% filter(teacher1 > 1)  %>% select(calendar_id, teacher = teacher1)
+has2teach  <- calendar  %>% filter(teacher2 > 1)  %>% select(calendar_id, teacher = teacher2)
+ # cbind them together, check on whether they are "outsiders" or not, 
+ #  then merge back with calendar to classify the event
+
+```
+
+```{r}
+cal_stats <- calendar %>% filter(location == center_id, visible == 1, cancelled == 0) %>% 
+  group_by(quarter_start) %>% 
+  summarize( median = median(create_to_start_weeks, na.rm = T), 
+             prog_types = n_distinct(program_code),
+             n = n())
+
+cal_stats <- group_by(center214, program_code) %>% summarize(n = n()) %>% 
+  arrange(desc(n))
+
+write_csv(cal_stats,"cal_stats.csv")
+write_csv(cal_stats,"cal_stats.csv")
+  
+```
+An intermediate level of detail might be:
+
+level	name	series
+L01	Level 1	WoS
+L02	Level 2	WoS
+L03	Level 3	WoS
+L04	Level 4	WoS
+L05	Level 5	WoS
+L06	GES	Sacred Path
+L07	Windhorse	Sacred Path
+L08	Drala	Sacred Path
+L09	Meek	Sacred Path
+L10	Perky	Sacred Path
+L11 Outrageous/Incscrutable	Sacred Path
+L12	Golden Key	Sacred Path
+L13	Warrior's Assembly	Sacred Path
+TIC	MIEL	IEL Series
+LIC	JIEL	IEL Series
+GAC	FIEL	IEL Series
+DRC	WIEL	IEL Series
+BG1	BG1	BG Series
+BG2	BG2	BG Series
+BG3	BG3	BG Series
+RWK	Rigden	Rigden
+ESA	ESA	ESA
+```

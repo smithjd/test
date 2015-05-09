@@ -1,0 +1,138 @@
+---
+title: "Dixie Elders - March 2015"
+author: "John D. Smith"
+date: "March 21, 2015"
+output: html_document
+---
+One project I'm working on is a grant proposal to Shambhala Trust for captioning Way of Shambhala videos. I'm hoping you can help me get some supporting data, or tell me how to query the database.
+
+I'd like to know 2 things:
+
+1.  the percentage of people over 60 who are in the database. Since about 1/3 of people over 60 have hearing impairment, they may benefit from captions. 
+
+2.  the percentage those folks over 60 who have not done the entire Way of Shambhala series. That's the 3 Basic Goodness programs and the 5 in Everyday Life programs. 
+
+I don't suppose the SDB would have any info about special needs? Stefan Carmien is going to give me some information about the data collected from the Accessibilities working group which should help with this. 
+
+```{r}
+library(RMySQL)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(reshape2)
+library(xtable)
+
+setwd("~/Documents/Shambhala/PSMC-Comm-IT/statistics/misc-queries")
+
+con  <- dbConnect(MySQL(), user="Predictor", password= Sys.getenv("SDB_PASSWORD"),
+                  dbname="SDB_STATISTICS", host="46.252.31.8", port=3308)
+
+```
+
+You can also embed plots, for example:
+
+```{r}
+members <- dbGetQuery(con,
+                          paste(
+    "SELECT members.id, membertype as membercode, center, members.continent, members.country, countries.ID, countries.COUNTRY as country_name, TLD, ",
+    "CASE WHEN birth = '0000-00-00' THEN NULL ELSE birth END AS birthdate, ",
+    "CASE WHEN firstcontact = '0000-00-00' THEN NULL ELSE firstcontact END AS firstcontactdate ",
+    "FROM members LEFT JOIN countries ON ",
+    "members.country = countries.ID")
+        )
+str(members)
+
+membership <- dbReadTable(con, "membership")
+membership <- mutate(membership, membercode=id,membertype=name) %>% select(membercode,membertype)
+membership[,"membercode"] <- as.character(membership$membercode)
+```
+Clean up the data before anything else...
+```{r}
+
+mem <- members %>% mutate(birthdate = ymd(birthdate), 
+      firstcontactdate = (ymd(firstcontactdate)),       
+      years_at_1st_contact = as.numeric(difftime(firstcontactdate,birthdate,unit="weeks")/52.25),
+      older = ifelse(birthdate < now() - years(60),"60+better","Younger"),
+      older = ifelse(is.na(older),"Birthdate Missing",older),
+      est_birthdate = ifelse(is.na(birthdate) & !is.na(firstcontactdate), firstcontactdate - years(40), birthdate),
+      e_older = ifelse(est_birthdate < now() - years(60),"60+better","Younger"),
+      e_older = ifelse(is.na(e_older),"Birthdate Missing",e_older),
+      country_language = ifelse(country_name %in% c("CANADA", "UNITED STATES", "UNITED KINGDOM", "AUSTRALIA", "BAHAMAS", "BERMUDA", "IRELAND"), "English-speaking","Non-English-speaking")
+            )
+mean(mem$years_at_1st_contact,na.rm=T)
+summary(mem)
+mem <- left_join(mem,membership) 
+
+# First look at counts using recorded birthdate
+elders_lang <- group_by(mem,country_language,membertype,older) %>% summarise(count=n())
+
+elders_lang_wide <- dcast(elders_lang, country_language+membertype ~ older, value.var = "count")
+
+# Now look at counts using estimated birthdate
+est_elders_lang <- group_by(mem,country_language,membertype,e_older) %>% summarise(count=n())
+
+est_elders_lang_wide <- dcast(est_elders_lang, country_language+membertype ~ e_older, value.var = "count")
+```
+Counting records using recorded age
+```{r results='asis', echo=FALSE}
+
+elder.table  <- xtable(
+  elders_lang_wide [,c("country_language", "membertype", 
+                  "60+better", "Birthdate Missing", "Younger")],
+  caption="SDB Records by Country Language, Membership Status, and recorded Age")
+
+digits(elder.table)  <- 0
+align(elder.table)[c(4,5,6)]  <- "r"
+html <- print(elder.table,include.rownames=FALSE,floating=F,type='html')
+writeLines(html,"elder_table.htm")
+# sink( file="text.html")
+# print(elder.table,type="html")
+# sink()
+  
+```
+Counting records using estimated age
+```{r results='asis', echo=FALSE}
+
+elder.table  <- xtable(
+  est_elders_lang_wide [,c("country_language", "membertype", 
+                  "60+better", "Birthdate Missing", "Younger")],
+  caption="SDB Records by Country Language, Membership Status, and estimated Age")
+
+digits(elder.table)  <- 0
+align(elder.table)[c(4,5,6)]  <- "r"
+html <- print(elder.table,include.rownames=FALSE,floating=F,type='html')
+writeLines(html,"est_elder_table.htm")
+# sink( file="text.html")
+# print(elder.table,type="html")
+# sink()
+```
+Now look at the difference between the two.
+```{r}
+elders_lang <- elders_lang %>% rename(raw_count=count)
+est_elders_lang <- est_elders_lang %>% rename(est_count=count,older=e_older)
+
+merge_methods <- left_join(elders_lang,est_elders_lang)
+merge_methods <- merge_methods %>% mutate(diff = est_count - raw_count)
+
+```
+look at West coast centers
+
+center_id	center_name
+186	Santa Rosa
+42	Fraser Valley
+214	Portland
+183	San Rafael
+242	Bellingham
+180	Sonoma
+177	San Francisco
+211	Seattle
+178	Berkeley
+185	Silicon Valley
+184	Santa Cruz
+```{r}
+(west_coast  <- read.csv (row.names = NULL, header = TRUE, sep = "\t", file= "west_coast_centers.csv" ))
+
+west_coast_members <- semi_join(mem,west_coast)
+```
+

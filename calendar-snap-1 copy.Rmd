@@ -1,0 +1,240 @@
+---
+title: "Calendar Snapshot V 1"
+author: "John D. Smith"
+date: "April 28, 2015"
+output: html_document
+---
+
+Declarations and setup
+
+
+```{r}
+library(RMySQL)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(reshape2)
+library(xtable)
+
+setwd("~/Documents/Shambhala/PSMC-Comm-IT/statistics/misc-queries")
+
+# con  <- dbConnect(MySQL(), user="Predictor", password= Sys.getenv("SDB_PASSWORD"),
+#                   dbname="SDB_STATISTICS", host="46.252.31.8", port=3308)
+
+my_sdb <- src_mysql(user = "Predictor", password = Sys.getenv("SDB_PASSWORD"),
+                  dbname = "SDB_STATISTICS", host = "46.252.31.8", port = 3308)
+ 
+source("misc-tables.R")
+program_codes_tbl  <- read_tsv("prog_codes_table.tsv")
+program_series <- read_tsv("program_series.csv")
+
+
+```
+
+pull registrations and calendar data
+
+Need to include ALL registrations and the WHOLE shambhala calendar before zeroing in on ONE Center's members / calendar.
+
+```{r, echo=FALSE}
+
+sdb_registrations <- tbl(my_sdb, "registrations")
+sdb_registrations_internet <- tbl(my_sdb, "registrations_internet")
+sdb_calendar  <- tbl(my_sdb, "calendar")
+
+
+registrations <- sdb_registrations %>%
+  select(reg_id = id, calendar_id = idcalendar, member_id = idmember) %>%
+  collect() 
+
+registrations_internet <- sdb_registrations_internet %>%
+  select(reg_id = id, calendar_id = idcalendar, member_id = idmember) %>%
+  collect() 
+
+registrations <- bind_rows(registrations, registrations_internet) %>% filter (calendar_id != 0)
+# for historic data, date_end is sometimes missing, so set it to 1 day after day_start
+
+calendar <- sdb_calendar  %>%
+  select(calendar_id = id, cal_create_dt = created, date_begin, date_end,  
+         program_code = code, program_price = price,
+         location, program_name = name, local_event, public, max_reg, 
+         teacher1, teacher2, cancelled, visible ) %>% 
+  collect() %>% 
+    # deal with a bunch of date issues, like missing date, calculate length of time, quarter, etc.
+    mutate(
+       cal_create_dt = sub("0000-00-00 00:00:00", " ", cal_create_dt),  
+         cal_create_dt = ymd_hms(cal_create_dt),
+       date_begin = sub("0000-00-00 00:00:00", " ", date_begin),  date_begin = ymd_hms(date_begin),
+       date_end = sub("0000-00-00 00:00:00", " ", date_end),  date_end = ymd_hms(date_end),
+       # the following calc messes up date_end, so leaving NA's 
+       # date_end = ifelse(is.na(date_end) & !is.na(date_begin), date_begin + 86400, date_end), 
+       class_length_days = difftime(date_end, date_begin, units = "days"), 
+       day_begin = weekdays(date_begin, abbreviate = F),
+       create_to_begin_weeks = difftime(date_begin, cal_create_dt, units = "weeks"),
+       quarter_begin = paste( year(date_begin), "-Q", quarter(date_begin), sep = ""),
+       program_price_num = sub(" .+$", "", program_price),  
+       program_price_num = as.numeric(gsub("\\$", "", program_price_num)),
+       weekend_class = ifelse(day_begin %in% c("Friday","Saturday","Sunday") & 
+                            class_length_days < 3, 1, 0)
+         )
+
+calendar <- left_join(calendar, program_codes_tbl)
+
+str(calendar)
+str(program_codes_tbl)
+
+```
+Pull membership data 
+```{r, echo=FALSE}
+# Portland
+center_id <- "214"
+# Seattle
+# center_id <- "211"
+
+# Denver
+# center_id <- "218"
+
+# Bellingham
+# center_id <- "242"
+
+sdb_members <- tbl(my_sdb, "members")
+members  <- sdb_members %>% 
+  select(member_id = id, m_rec_date_changed = changed, member_center = center, membertype, 
+         m_rec_date_create = created, creator, editor, ismale) %>% 
+  collect() %>% mutate(
+        m_rec_date_create = sub("0000-00-00 00:00:00", " ", m_rec_date_create),  
+        m_rec_date_create = ymd_hms(m_rec_date_create),
+        m_rec_date_changed = sub("0000-00-00 00:00:00", " ", m_rec_date_changed),  
+        m_rec_date_changed = ymd_hms(m_rec_date_changed))
+
+  # filter(center == center_id) %>% 
+
+# Join them all together in various ways
+# lj_mem_reg <- left_join(members,registrations) %>% filter(!is.na(reg_id)) %>% group_by(member_center,membertype,ismale,calendar_id) %>% mutate(registrations = n()) %>% select(-member_id, -m_rec_date_changed, -m_rec_date_create, -creator, -editor, -reg_id)
+
+lj_mem_reg <- left_join(members,registrations) %>% filter(!is.na(reg_id)) %>%
+  mutate( ismember = ifelse(membertype %in% c("3", "4","5"), "Member", "Non_member") ) %>% 
+  group_by(member_center, ismember, calendar_id) %>% summarise(registrations = n()) %>% 
+  select(calendar_id, member_center, ismember, registrations )
+
+lj_mem_reg_wide <- dcast(lj_mem_reg, calendar_id + member_center ~ ismember, value.var = "registrations" ) %>% 
+  mutate(Member = ifelse(is.na(Member), 0, Member),
+         Non_member = ifelse(is.na(Non_member), 0, Non_member),
+         total_reg = Member + Non_member)
+
+         
+  
+# est_elders_lang_wide <- dcast(est_elders_lang, country_language+membertype ~ e_older, value.var = "count")
+# %>% select(-member_id, -m_rec_date_changed, -m_rec_date_create, -creator, -editor, -reg_id)
+
+dim(lj_mem_reg)
+# lj_reg_cal <- left_join(registrations,calendar)
+# lj_reg_cal_mem <- left_join(lj_reg_cal, members)
+
+# lj_mem_reg <- left_join(members,registrations)
+# lj_mem_reg_cal <- left_join(lj_mem_reg,calendar)
+# save(lj_mem_reg_cal,file="lj_mem_reg_cal.Rdata")
+```
+
+```{r}
+
+
+```
+
+Look at Portland alone
+```{r}
+
+
+# center214 <- lj_reg_cal_mem %>% filter(location == center_id | center == center_id )
+center214 <- lj_reg_cal_mem %>% filter(location == center_id )
+summary(center214)
+
+# check out https://shambhala.name/report_event.php?id=223092 
+
+#   bg_event2 <- lj_reg_cal_mem %>% filter(calendar_id == 202166)
+#   # no location code
+#   bg_cal <- calendar %>% filter(calendar_id == 223092)
+
+```
+Calc based on the calendar itself
+
+  * length of classes (end-date minus start-date)
+  * day of week class starts
+  * weeks between event first posted and event start date
+  * classify as weekend / weeknight
+  classify as core curriculum, e.g.,
+    event_type in "Introductory Programs", "Sacred Path", "Way of Shambhala"
+  classify by program category (core, practice, other)
+  *  program price as a number
+
+Depend on member record merge
+  % of registrants who are members
+  % of registrants who are not local (e.g., out-of-towners)
+  weeks between event first posted and first registrant
+  median registrant and event start date
+  % of your students taking classes elsewhere
+
+teacher info
+  % of classes taught by one or more local teachers
+  % of classes taught by one or more out-of-towners
+  % of classes taught by a local and out-of-towner  ??
+
+After Aggregation
+  Average enrollments by program category
+  number of public classes
+  number of classes with pre-requisites
+  % of classes that are not in the core curriculum
+  weekend / weeknight ratio
+
+-------
+% of classes through Shambhala Online (Rockwell) look like an out of town teacher
+
+```{r}
+
+hasteach  <- calendar  %>% filter(teacher1 > 1)  %>% select(calendar_id, teacher = teacher1)
+has2teach  <- calendar  %>% filter(teacher2 > 1)  %>% select(calendar_id, teacher = teacher2)
+ # cbind them together, check on whether they are "outsiders" or not, 
+ #  then merge back with calendar to classify the event
+
+```
+
+```{r}
+cal_stats <- calendar %>% filter(location == center_id, visible == 1, cancelled == 0) %>% 
+  group_by(quarter_start) %>% 
+  summarize( median = median(create_to_start_weeks, na.rm = T), 
+             prog_types = n_distinct(program_code),
+             n = n())
+
+cal_stats <- group_by(center214, program_code) %>% summarize(n = n()) %>% 
+  arrange(desc(n))
+
+write_csv(cal_stats,"cal_stats.csv")
+write_csv(cal_stats,"cal_stats.csv")
+  
+```
+An intermediate level of detail might be:
+
+level	name	series
+L01	Level 1	WoS
+L02	Level 2	WoS
+L03	Level 3	WoS
+L04	Level 4	WoS
+L05	Level 5	WoS
+L06	GES	Sacred Path
+L07	Windhorse	Sacred Path
+L08	Drala	Sacred Path
+L09	Meek	Sacred Path
+L10	Perky	Sacred Path
+L11 Outrageous/Incscrutable	Sacred Path
+L12	Golden Key	Sacred Path
+L13	Warrior's Assembly	Sacred Path
+TIC	MIEL	IEL Series
+LIC	JIEL	IEL Series
+GAC	FIEL	IEL Series
+DRC	WIEL	IEL Series
+BG1	BG1	BG Series
+BG2	BG2	BG Series
+BG3	BG3	BG Series
+RWK	Rigden	Rigden
+ESA	ESA	ESA
+```
