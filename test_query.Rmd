@@ -1,0 +1,132 @@
+---
+title: "Portland access to SMC"
+author: "John D. Smith"
+date: "April 14, 2015"
+output: html_document
+---
+
+Declarations and setup
+
+```{r}
+library(RMySQL)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(reshape2)
+library(xtable)
+
+setwd("~/Documents/Shambhala/PSMC-Comm-IT/statistics/misc-queries")
+
+# con  <- dbConnect(MySQL(), user="Predictor", password= Sys.getenv("SDB_PASSWORD"),
+#                   dbname="SDB_STATISTICS", host="46.252.31.8", port=3308)
+my_sdb <- src_mysql(user="Predictor", password= Sys.getenv("SDB_PASSWORD"),
+                  dbname="SDB_STATISTICS", host="46.252.31.8", port=3308)
+source("misc-tables.R")
+member.type <- member.type %>% mutate(member.type.var.name = gsub("[ -]", ".", member.type)) %>% 
+  mutate(member.type.var.name = gsub("\\.\\.", ".", member.type.var.name))
+
+```
+
+pull basic registration data
+```{r, echo=FALSE}
+
+sdb_registrations <- tbl(my_sdb, "registrations")
+sdb_calendar  <- tbl(my_sdb, "calendar")
+
+
+registrations <- sdb_registrations %>%
+  select(reg_id = id, calendar_id = idcalendar, member_id = idmember) %>%
+  collect() 
+  
+calendar <- sdb_calendar  %>%
+  select(program_code = code, date_begin, date_end, calendar_id = id, location, program_name = name) %>%
+  collect() %>% mutate(date_begin = ymd_hms(date_begin), date_end = ymd_hms(date_end)) 
+
+```
+Pull membership data by center
+```{r, echo=FALSE}
+# Portland
+center_id <- "214"
+# Seattle
+center_id <- "211"
+
+# Denver
+center_id <- "218"
+
+# Bellingham
+center_id <- "242"
+
+sdb_members <- tbl(my_sdb, "members")
+members  <- sdb_members %>% 
+  filter(center == center_id) %>% 
+  select(member_id = id, changed, center, membertype, created, creator, editor, ismale) %>% 
+  collect() %>% mutate(changed = ymd_hms(changed), created = ymd_hms(created))
+
+
+# Join them all together in various ways
+
+lj_mem_reg <- left_join(members,registrations)
+
+lj_mem_reg_cal <- left_join(lj_mem_reg,calendar)
+save(lj_mem_reg_cal,file="lj_mem_reg_cal.Rdata")
+```
+do some stats
+```{r}
+participation <- lj_mem_reg_cal %>% mutate( travel_to = ifelse(center == location, "Home", 
+      ifelse(location %in% c("219", "367", "200", "167", "31", "168", "169", "232"), "Land.Center", "Other.Center" )), travel_to = ifelse(is.na(reg_id),"No.classes", travel_to), travel_to = ifelse(is.na(date_begin), "Other.Center", travel_to))
+  
+# not sure if this dataset is usefull:
+par_pattern <- participation %>% group_by(member_id, membertype, travel_to ) %>% summarise(registrations = n())
+
+par_rept <- par_pattern %>% group_by(membertype, travel_to) %>% summarize(n_mems = n(), n_events = sum(registrations))
+
+no_travel <- dcast(par_pattern, member_id + membertype ~ travel_to, value.var="registrations")
+
+no_travel <- no_travel %>% mutate(Land.Center = ifelse(is.na(Land.Center), 0, Land.Center ),
+                                  Other.Center = ifelse(is.na(Other.Center), 0, Other.Center ),
+                                  Home = ifelse(is.na(Home), 0, Home ))
+
+no_travel <- no_travel %>%
+  mutate(ever_at_home_center = ifelse(Home > 0,"Yes", "No"),
+  ever_at_land_center = ifelse(Land.Center > 0,"Yes", "No"),
+  ever_at_other_center = ifelse(Other.Center > 0, "Yes", "No")) 
+
+no_travel_rept <- no_travel %>% 
+  group_by(membertype, ever_at_home_center, ever_at_land_center, ever_at_other_center) %>% summarise (n_mems = n())
+
+mlist  <- as.list(member.type$member.type.var.name)[1:5]
+# mlist
+new.var.list <- append(c("ever_at_land_center", "ever_at_other_center", "ever_at_home_center"), mlist)
+
+# new.var.list
+
+# no_travel_rept <- no_travel_rept %>% filter(ever_at_land_center == "No") 
+no_travel_rept_1 <- dcast(no_travel_rept, ever_at_land_center + ever_at_other_center + ever_at_home_center  ~ membertype , value.var = "n_mems")  %>% arrange(desc(ever_at_land_center), desc(ever_at_other_center), desc(ever_at_home_center))
+names(no_travel_rept_1) <- new.var.list
+
+no_travel_rept_1 <- no_travel_rept_1 %>% mutate(
+  Non.member = ifelse(is.na( Non.member ), 0, Non.member ),
+  Friend.of.Shambhala = ifelse(is.na( Friend.of.Shambhala ), 0, Friend.of.Shambhala ),
+  Member = ifelse(is.na( Member), 0 , Member),
+  Ex.member = ifelse(is.na( Ex.member), 0 , Ex.member),
+  Temp.Inactive= ifelse(is.na(Temp.Inactive ), 0 , Temp.Inactive))
+
+
+str(no_travel_rept_1)
+no_travel_rept_1
+csv.file.name <- paste("ever_been_there_",center_id, ".csv")
+html.file.name <- paste("ever_been_there_",center_id, ".html")
+write.csv(no_travel_rept_1, file = csv.file.name)
+
+# make a pretier table
+ 
+center_id
+travel.table  <- xtable(
+  no_travel_rept_1[,c("ever_at_land_center", "ever_at_other_center", "ever_at_home_center", "Non.member", "Friend.of.Shambhala", "Member", "Ex.member", "Temp.Inactive")],
+  caption="Travel to Land Centers")
+
+digits(travel.table)  <- 0
+align(travel.table)[c(5,6,7,8,9)]  <- "r"
+print(travel.table,file= html.file.name,include.rownames=FALSE,floating=F,type='html')
+```
